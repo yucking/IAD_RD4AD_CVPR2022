@@ -1,0 +1,5 @@
+mvtec/
+checkpoints/
+__pycache__/
+results_all/
+logs/

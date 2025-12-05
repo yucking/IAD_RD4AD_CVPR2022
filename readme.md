@@ -27,3 +27,12 @@ We have write both training and evaluation function in the main.py, execute the 
     month     = {June},
     year      = {2022},
     pages     = {9737-9746}}
+
+
+
+
+2025/7/21
+
+pip install torch==2.3.0 torchvision==0.18.0 --index-url https://download.pytorch.org/whl/cu121 \
+--no-cache-dir --timeout 60 --retries 10 --progress-bar on
+

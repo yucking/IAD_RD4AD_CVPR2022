@@ -7,7 +7,7 @@ from resnet import resnet18, resnet34, resnet50, wide_resnet50_2
 from de_resnet import de_resnet18, de_resnet50, de_wide_resnet50_2
 from dataset import MVTecDataset
 from torch.nn import functional as F
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score , roc_curve
 import cv2
 import matplotlib.pyplot as plt
 from sklearn.metrics import auc
@@ -21,22 +21,21 @@ from matplotlib.ticker import NullFormatter
 from scipy.spatial.distance import pdist
 import matplotlib
 import pickle
+import os
 
-def cal_anomaly_map(fs_list, ft_list, out_size=224, amap_mode='mul'):
+def cal_anomaly_map(ft_list, fs_list, out_size=224, amap_mode='mul'):# 特征差异图计算
     if amap_mode == 'mul':
-        anomaly_map = np.ones([out_size, out_size])
+        anomaly_map = np.ones([out_size, out_size]) # 点乘情况下 所有值初始化为 1;
     else:
-        anomaly_map = np.zeros([out_size, out_size])
+        anomaly_map = np.zeros([out_size, out_size])# 加法情况下 所有值初始化为 0；
     a_map_list = []
     for i in range(len(ft_list)):
-        fs = fs_list[i]
+        fs = fs_list[i] # shape=[B,C,H,W] 
         ft = ft_list[i]
-        #fs_norm = F.normalize(fs, p=2)
-        #ft_norm = F.normalize(ft, p=2)
-        a_map = 1 - F.cosine_similarity(fs, ft)
-        a_map = torch.unsqueeze(a_map, dim=1)
-        a_map = F.interpolate(a_map, size=out_size, mode='bilinear', align_corners=True)
-        a_map = a_map[0, 0, :, :].to('cpu').detach().numpy()
+        a_map = 1 - F.cosine_similarity(ft, fs) # shape=[B,H,W] 
+        a_map = torch.unsqueeze(a_map, dim=1)   # shape=[B,1,H,W] 
+        a_map = F.interpolate(a_map, size=out_size, mode='bilinear', align_corners=True) # 上采样到统一分辨率
+        a_map = a_map[0, 0, :, :].to('cpu').detach().numpy() # 转为 NumPy 图（2D）
         a_map_list.append(a_map)
         if amap_mode == 'mul':
             anomaly_map *= a_map
@@ -45,35 +44,31 @@ def cal_anomaly_map(fs_list, ft_list, out_size=224, amap_mode='mul'):
     return anomaly_map, a_map_list
 
 def show_cam_on_image(img, anomaly_map):
-    #if anomaly_map.shape != img.shape:
-    #    anomaly_map = cv2.applyColorMap(np.uint8(anomaly_map), cv2.COLORMAP_JET)
-    cam = np.float32(anomaly_map)/255 + np.float32(img)/255
-    cam = cam / np.max(cam)
-    return np.uint8(255 * cam)
+    '''将原图 img 与异常热图 anomaly_map 叠加，形成彩色高亮图，用于可视化异常区域。'''
+    cam = np.float32(anomaly_map)/255 + np.float32(img)/255 # 转为 float32 并归一化至 0~1: 图像亮的区域 + 异常高响应的区域 → 更亮
+    cam = cam / np.max(cam) # 重新归一化回 [0, 1] : 防止叠加后数值 >1，导致图像溢出（如出现白块）并 重新拉伸到最大值为 1
+    return np.uint8(255 * cam) # 恢复为可显示的 uint8 图像，得到最终可显示的 RGB 图
 
 def min_max_norm(image):
+    '''对任意图像进行最小-最大归一化，使其值分布在 [0, 1]'''
     a_min, a_max = image.min(), image.max()
     return (image-a_min)/(a_max - a_min)
 
-def cvt2heatmap(gray):
+def cvt2heatmap(gray): # 输入必须是 uint8 类型（0~255）
+    '''将灰度图转换为彩色热图（红-黄-蓝）用于可视化异常响应'''
     heatmap = cv2.applyColorMap(np.uint8(gray), cv2.COLORMAP_JET)
     return heatmap
 
 
 
 def evaluation(encoder, bn, decoder, dataloader,device,_class_=None):
-    #_, t_bn = resnet50(pretrained=True)
-    #bn.load_state_dict(bn.state_dict())
     bn.eval()
-    #bn.training = False
-    #t_bn.to(device)
-    #t_bn.load_state_dict(bn.state_dict())
     decoder.eval()
-    gt_list_px = []
-    pr_list_px = []
-    gt_list_sp = []
-    pr_list_sp = []
-    aupro_list = []
+    gt_list_px = []  # 所有像素的 Ground Truth
+    pr_list_px = []  # 所有像素的预测 anomaly score
+    gt_list_sp = []  # 每张图的 ground truth 标签（0 或 1）
+    pr_list_sp = []  # 每张图的 anomaly score（使用 max pooling）
+    aupro_list = []  # 每张图的 PRO 区域准确性得分
     with torch.no_grad():
         for img, gt, label, _ in dataloader:
 
@@ -83,7 +78,8 @@ def evaluation(encoder, bn, decoder, dataloader,device,_class_=None):
             anomaly_map, _ = cal_anomaly_map(inputs, outputs, img.shape[-1], amap_mode='a')
             anomaly_map = gaussian_filter(anomaly_map, sigma=4)
             gt[gt > 0.5] = 1
-            gt[gt <= 0.5] = 0
+            gt[gt <= 0.5] = 0 # 正常
+            # 计算 AUPRO（区域级指标，只有异常样本计算）
             if label.item()!=0:
                 aupro_list.append(compute_pro(gt.squeeze(0).cpu().numpy().astype(int),
                                               anomaly_map[np.newaxis,:,:]))
@@ -100,7 +96,6 @@ def evaluation(encoder, bn, decoder, dataloader,device,_class_=None):
         # np.save('vis.npy',vis_data)
         #with open('{}_vis.pkl'.format(_class_), 'wb') as f:
         #    pickle.dump(vis_data, f, pickle.HIGHEST_PROTOCOL)
-
 
         auroc_px = round(roc_auc_score(gt_list_px, pr_list_px), 3)
         auroc_sp = round(roc_auc_score(gt_list_sp, pr_list_sp), 3)
@@ -132,42 +127,40 @@ def test(_class_):
     print(_class_,':',auroc_px,',',auroc_sp,',',aupro_px)
     return auroc_px
 
-import os
-
-def visualization(_class_):
+def visualization(_class_, test_id=0):
     print(_class_)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(device)
 
     data_transform, gt_transform = get_data_transforms(256, 256)
-    test_path = '../mvtec/' + _class_
-    ckp_path = './checkpoints/' + 'rm_1105_wres50_ff_mm_'+_class_+'.pth'
+    test_path = './mvtec/' + _class_
+    ckpt_dir = f'./checkpoints/{test_id}'
+    os.makedirs(ckpt_dir, exist_ok=True)
+    ckp_path = f'{ckpt_dir}/wres50_{_class_}.pth'
+
     test_data = MVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test")
     test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False)
 
     encoder, bn = wide_resnet50_2(pretrained=True)
     encoder = encoder.to(device)
     bn = bn.to(device)
-
     encoder.eval()
+
     decoder = de_wide_resnet50_2(pretrained=False)
     decoder = decoder.to(device)
+
     ckp = torch.load(ckp_path)
-    for k, v in list(ckp['bn'].items()):
+    for k in list(ckp['bn'].keys()):
         if 'memory' in k:
-            ckp['bn'].pop(k)
+            del ckp['bn'][k]
     decoder.load_state_dict(ckp['decoder'])
     bn.load_state_dict(ckp['bn'])
 
+    pr_list_sp = []
+    gt_list_sp = []
     count = 0
     with torch.no_grad():
         for img, gt, label, _ in test_dataloader:
-            if (label.item() == 0):
-                continue
-            #if count <= 10:
-            #    count += 1
-            #    continue
-
             decoder.eval()
             bn.eval()
 
@@ -175,58 +168,61 @@ def visualization(_class_):
             inputs = encoder(img)
             outputs = decoder(bn(inputs))
 
-            #inputs.append(feature)
-            #inputs.append(outputs)
-            #t_sne(inputs)
-
-
             anomaly_map, amap_list = cal_anomaly_map([inputs[-1]], [outputs[-1]], img.shape[-1], amap_mode='a')
             anomaly_map = gaussian_filter(anomaly_map, sigma=4)
             ano_map = min_max_norm(anomaly_map)
-            ano_map = cvt2heatmap(ano_map*255)
-            img = cv2.cvtColor(img.permute(0, 2, 3, 1).cpu().numpy()[0] * 255, cv2.COLOR_BGR2RGB)
-            img = np.uint8(min_max_norm(img)*255)
-            #if not os.path.exists('./results_all/'+_class_):
-            #    os.makedirs('./results_all/'+_class_)
-            #cv2.imwrite('./results_all/'+_class_+'/'+str(count)+'_'+'org.png',img)
-            #plt.imshow(img)
-            #plt.axis('off')
-            #plt.savefig('org.png')
-            #plt.show()
-            ano_map = show_cam_on_image(img, ano_map)
-            #cv2.imwrite('./results_all/'+_class_+'/'+str(count)+'_'+'ad.png', ano_map)
-            plt.imshow(ano_map)
-            plt.axis('off')
-            #plt.savefig('ad.png')
-            plt.show()
+            ano_map = cvt2heatmap(ano_map * 255)
 
-            gt = gt.cpu().numpy().astype(int)[0][0]*255
-            #cv2.imwrite('./results/'+_class_+'_'+str(count)+'_'+'gt.png', gt)
+            img_np = cv2.cvtColor(img.permute(0, 2, 3, 1).cpu().numpy()[0] * 255, cv2.COLOR_BGR2RGB)
+            img_np = np.uint8(min_max_norm(img_np) * 255)
 
-            #b, c, h, w = inputs[2].shape
-            #t_feat = F.normalize(inputs[2], p=2).view(c, -1).permute(1, 0).cpu().numpy()
-            #s_feat = F.normalize(outputs[2], p=2).view(c, -1).permute(1, 0).cpu().numpy()
-            #c = 1-min_max_norm(cv2.resize(anomaly_map,(h,w))).flatten()
-            #print(c.shape)
-            #t_sne([t_feat, s_feat], c)
-            #assert 1 == 2
+            output_dir = f'./results_all/{test_id}/{_class_}'
+            os.makedirs(output_dir, exist_ok=True)
 
-            #name = 0
-            #for anomaly_map in amap_list:
-            #    anomaly_map = gaussian_filter(anomaly_map, sigma=4)
-            #    ano_map = min_max_norm(anomaly_map)
-            #    ano_map = cvt2heatmap(ano_map * 255)
-                #ano_map = show_cam_on_image(img, ano_map)
-                #cv2.imwrite(str(name) + '.png', ano_map)
-                #plt.imshow(ano_map)
-                #plt.axis('off')
-                #plt.savefig(str(name) + '.png')
-                #plt.show()
-            #    name+=1
+            cv2.imwrite(f'{output_dir}/{count}_org.png', img_np)
+            ano_map_vis = show_cam_on_image(img_np, ano_map)
+            cv2.imwrite(f'{output_dir}/{count}_ad.png', ano_map_vis)
+
+            gt_img = gt.cpu().numpy().astype(int)[0][0] * 255
+            cv2.imwrite(f'{output_dir}/{count}_gt.png', gt_img.astype(np.uint8))
+
+            pr_list_sp.append(np.max(anomaly_map))
+            gt_list_sp.append(label.item())
+
             count += 1
-            #if count>20:
-            #    return 0
-                #assert 1==2
+
+    # Score histogram
+    plt.figure(figsize=(8, 4))
+    plt.hist([np.array(pr_list_sp)[np.array(gt_list_sp) == 0],
+              np.array(pr_list_sp)[np.array(gt_list_sp) == 1]],
+             label=['Normal', 'Anomaly'], bins=20, alpha=0.7, color=['blue', 'red'])
+    plt.xlabel('Anomaly Score')
+    plt.ylabel('Frequency')
+    plt.title(f'Score Distribution: {_class_}')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f'{output_dir}/score_hist.png')
+    plt.close()
+
+    # ROC Curve
+    if len(set(gt_list_sp)) > 1:
+        fpr, tpr, thresholds = roc_curve(gt_list_sp, pr_list_sp)
+        auc_score = roc_auc_score(gt_list_sp, pr_list_sp)
+
+        plt.figure(figsize=(6, 6))
+        plt.plot(fpr, tpr, label=f'AUROC = {auc_score:.3f}', color='darkorange')
+        plt.plot([0, 1], [0, 1], 'k--', linewidth=0.5)
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title(f'ROC Curve: {_class_}')
+        plt.legend(loc='lower right')
+        plt.tight_layout()
+        plt.savefig(f'{output_dir}/roc_curve.png')
+        plt.close()
+    else:
+        print(f"⚠️ ROC curve not plotted: only one class present in gt for {_class_}.")
+
+
 
 
 def vis_nd(name, _class_):
@@ -352,7 +348,8 @@ def compute_pro(masks: ndarray, amaps: ndarray, num_th: int = 200) -> None:
     assert set(masks.flatten()) == {0, 1}, "set(masks.flatten()) must be {0, 1}"
     assert isinstance(num_th, int), "type(num_th) must be int"
 
-    df = pd.DataFrame([], columns=["pro", "fpr", "threshold"])
+    df = pd.DataFrame([], columns=["pro", "fpr", "threshold"], dtype=float)
+    #df = pd.DataFrame([], columns=["pro", "fpr", "threshold"])
     binary_amaps = np.zeros_like(amaps, dtype=np.bool)
 
     min_th = amaps.min()
@@ -375,7 +372,9 @@ def compute_pro(masks: ndarray, amaps: ndarray, num_th: int = 200) -> None:
         fp_pixels = np.logical_and(inverse_masks, binary_amaps).sum()
         fpr = fp_pixels / inverse_masks.sum()
 
-        df = df.append({"pro": mean(pros), "fpr": fpr, "threshold": th}, ignore_index=True)
+        #df = df.append({"pro": mean(pros), "fpr": fpr, "threshold": th}, ignore_index=True)
+        df = pd.concat([df, pd.DataFrame([{"pro": mean(pros), "fpr": fpr, "threshold": th}])], ignore_index=True)
+
 
     # Normalize FPR from 0 ~ 1 to 0 ~ 0.3
     df = df[df["fpr"] < 0.3]
